@@ -5,7 +5,7 @@ module Peatio
   module Bitgo
     class Client
       Error = Class.new(StandardError)
-      class ConnectionError < Error; end
+      ConnectionError = Class.new(Error)
 
       class ResponseError < Error
         def initialize(msg)
@@ -22,7 +22,7 @@ module Peatio
         args = [@endpoint.to_s + path]
 
         if data
-          if %i[ post put patch ].include?(verb)
+          if %i[post put patch].include?(verb)
             args << data.compact.to_json
             args << { 'Content-Type' => 'application/json' }
           else
@@ -43,9 +43,11 @@ module Peatio
         response['error'].tap { |error| raise ResponseError.new(error) if error }
         response
       rescue Faraday::Error => e
-        raise ConnectionError, e
-      rescue StandardError => e
-        raise Error, e
+        if e.is_a?(Faraday::ConnectionFailed) || e.is_a?(Faraday::TimeoutError)
+          raise ConnectionError, e
+        else
+          raise ConnectionError, JSON.parse(e.response.body)['message']
+        end
       end
     end
   end

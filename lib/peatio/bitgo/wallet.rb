@@ -1,9 +1,14 @@
 module Peatio
   module Bitgo
     class Wallet < Peatio::Wallet::Abstract
+      TIME_DIFFERENCE_IN_MINUTES = 10
+      XLM_MEMO_TYPES = { 'memoId': 'id', 'memoText': 'text', 'memoHash': 'hash', 'memoReturn': 'return' }
 
-      def initialize(settings = {})
-        @settings = settings
+      DEFAULT_FEATURES = { skip_deposit_collection: false }.freeze
+
+      def initialize(custom_features = {})
+        @features = DEFAULT_FEATURES.merge(custom_features).slice(*SUPPORTED_FEATURES)
+        @settings = {}
       end
 
       def configure(settings = {})
@@ -24,10 +29,14 @@ module Peatio
       def create_address!(options = {})
         currency = erc20_currency_id
         options.deep_symbolize_keys!
-        if options.dig(:pa_details,:address_id).present?
+
+        if options.dig(:pa_details, :address_id).present? &&
+           options.dig(:pa_details, :updated_at).present? &&
+           time_difference_in_minutes(options.dig(:pa_details, :updated_at)) >= TIME_DIFFERENCE_IN_MINUTES
+
           response = client.rest_api(:get, "#{currency}/wallet/#{wallet_id}/address/#{options.dig(:pa_details, :address_id)}")
           { address: response['address'], secret: bitgo_wallet_passphrase }
-        else
+        elsif options.dig(:pa_details, :address_id).blank?
           response = client.rest_api(:post, "#{currency}/wallet/#{wallet_id}/address")
           { address: response['address'], secret: bitgo_wallet_passphrase, details: { address_id: response['id'] }}
         end
@@ -36,7 +45,7 @@ module Peatio
       end
 
       def create_transaction!(transaction, options = {})
-        currency_options = @currency.fetch(:options).slice(:gas_limit, :gas_price)
+        currency_options = @currency.fetch(:options).slice(:gas_limit, :gas_price, :erc20_contract_address)
 
         if currency_options[:gas_limit].present? && currency_options[:gas_price].present?
           options.merge!(currency_options)
@@ -52,9 +61,10 @@ module Peatio
           end
 
           txid = client.rest_api(:post, "#{currency_id}/wallet/#{wallet_id}/sendcoins", {
-                                 address: transaction.to_address.to_s,
+                                 address: normalize_address(transaction.to_address.to_s),
                                  amount: amount.to_s,
-                                 walletPassphrase: bitgo_wallet_passphrase
+                                 walletPassphrase: bitgo_wallet_passphrase,
+                                 memo: xlm_memo(transaction.to_address.to_s)
           }.compact).fetch('txid')
 
           transaction.hash = normalize_txid(txid)
@@ -76,13 +86,15 @@ module Peatio
 
       def create_eth_transaction(transaction, options = {})
         amount = convert_to_base_unit(transaction.amount)
+        hop = true unless options.slice(:erc20_contract_address).present?
 
         txid = client.rest_api(:post, "#{currency_id}/wallet/#{wallet_id}/sendcoins", {
           address: transaction.to_address.to_s,
           amount: amount.to_s,
           walletPassphrase: bitgo_wallet_passphrase,
           gas: options.fetch(:gas_limit).to_i,
-          gasPrice: options.fetch(:gas_price).to_i
+          gasPrice: options.fetch(:gas_price).to_i,
+          hop: hop
         }.compact).fetch('txid')
 
         transaction.hash = normalize_txid(txid)
@@ -107,15 +119,21 @@ module Peatio
         raise Peatio::Wallet::ClientError, e
       end
 
-      def trigger_webhook_event(event)
-        currency_id = @wallet.fetch(:testnet).present? ? 't' + @currency.fetch(:id) : @currency.fetch(:id)
-        return unless currency_id == event['coin'] && @wallet.fetch(:wallet_id) == event['wallet']
+      def trigger_webhook_event(request)
+        currency = @wallet.fetch(:testnet).present? ? 't' + @currency.fetch(:id) : @currency.fetch(:id)
+        if request.params['type'] == 'transfer'
+          return unless currency == request.params['coin'] &&
+                        @wallet.fetch(:wallet_id) == request.params['wallet']
+        else
+          return unless @wallet.fetch(:wallet_id) == request.params['walletId']
+        end
 
-        if event['type'] == 'transfer'
-          transactions = fetch_transfer!(event['transfer'])
-          return { transfers: transactions }
-        elsif event['address_confirmation']
-          # TODO Add Address confirmation
+        if request.params['type'] == 'transfer'
+          transactions = fetch_transfer!(request.params['transfer'])
+          return transactions
+        elsif request.params['type'] == 'address_confirmation'
+          address_id = fetch_address_id(request.params['address'])
+          return { address_id: address_id, address: request.params['address'], currency_id: currency_id }
         end
       end
 
@@ -124,20 +142,30 @@ module Peatio
         address_confirmation_webhook(url)
       end
 
+      def fetch_address_id(address)
+        currency = erc20_currency_id
+        client.rest_api(:get, "#{currency}/wallet/#{wallet_id}/address/#{address}")
+              .fetch('id')
+      rescue Bitgo::Client::Error => e
+        raise Peatio::Wallet::ClientError, e
+      end
+
       def fetch_transfer!(id)
-        # TODO: Add Rspecs for this one
         response = client.rest_api(:get, "#{currency_id}/wallet/#{wallet_id}/transfer/#{id}")
         parse_entries(response['entries']).map do |entry|
           to_address =  if response.dig('coinSpecific', 'memo').present?
-                          build_address(response.dig('coinSpecific', 'memo').first)
+                          memo = response.dig('coinSpecific', 'memo')
+                          memo_type = memo.kind_of?(Array) ? memo.first  : memo
+                          build_address(entry['address'], memo_type)
                         else
                           entry['address']
                         end
-          state = if response['state'] == 'unconfrimed'
-                    'pending'
-                  elsif response['state'] == 'confirmed'
-                    'success'
-                  end
+          state = define_transaction_state(response['state'])
+
+          if response['outputs'].present?
+            output = response['outputs'].find { |out| out['address'] == to_address }
+            txout = output['index'] if output.present?
+          end
 
           transaction = Peatio::Transaction.new(
             currency_id: @currency.fetch(:id),
@@ -145,8 +173,7 @@ module Peatio
             hash: normalize_txid(response['txid']),
             to_address: to_address,
             block_number: response['height'],
-            # TODO: Add sendmany support
-            txout: 0,
+            txout: txout.to_i,
             status: state
           )
 
@@ -168,7 +195,7 @@ module Peatio
 
       def address_confirmation_webhook(url)
         client.rest_api(:post, "#{currency_id}/wallet/#{wallet_id}/webhooks", {
-          type: 'address_confirmation_webhook',
+          type: 'address_confirmation',
           allToken: true,
           url: url,
           label: "webhook for #{url}",
@@ -193,8 +220,8 @@ module Peatio
         @client ||= Client.new(uri, access_token)
       end
 
-      def build_address(memo)
-        "#{memo['address']}?memoId=#{memo['value']}"
+      def build_address(address, memo)
+        "#{address}?memoId=#{memo['value']}"
       end
 
       # All these functions will have to be done with the coin set to eth or teth
@@ -203,6 +230,28 @@ module Peatio
         return 'eth' if @currency.fetch(:options).slice(:erc20_contract_address).present?
 
         currency_id
+      end
+
+      def xlm_memo(address)
+        build_xlm_memo(address) if @currency.fetch(:id) == 'xlm'
+      end
+
+      def build_xlm_memo(address)
+        case address.split('?').last.split('=').first
+        when 'memoId'
+          memo_value_from(address, 'memoId')
+        when 'memoText'
+          memo_value_from(address, 'memoText')
+        when 'memoHash'
+          memo_value_from(address, 'memoHash')
+        when 'memoReturn'
+          memo_value_from(address, 'memoReturn')
+        end
+      end
+
+      def memo_value_from(address, type)
+        memo_value = address.partition(type + '=').last
+        return { type: XLM_MEMO_TYPES[type.to_sym], value: memo_value } if memo_value.present?
       end
 
       def currency_id
@@ -215,6 +264,14 @@ module Peatio
 
       def wallet_id
         @wallet.fetch(:wallet_id)
+      end
+
+      def normalize_address(address)
+        if @currency.fetch(:id) == 'xlm'
+          address.split('?').first
+        else
+          address
+        end
       end
 
       def normalize_txid(txid)
@@ -233,6 +290,21 @@ module Peatio
                 "#{value.to_d} - #{x.to_d} must be equal to zero."
         end
         x.to_i
+      end
+
+      def time_difference_in_minutes(updated_at)
+        (Time.now - updated_at)/60
+      end
+
+      def define_transaction_state(state)
+        case state
+        when 'unconfirmed'
+          'pending'
+        when 'confirmed'
+          'success'
+        when 'failed','rejected'
+          'failed'
+        end
       end
     end
   end
