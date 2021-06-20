@@ -1,5 +1,5 @@
 module Peatio
   module Bitgo
-    VERSION = "1.1.1"
+    VERSION = "2.6.6".freeze
   end
 end
